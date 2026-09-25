@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const session = require('express-session');
+const MongoStore = require('connect-mongo');
 const passport = require('passport');
 const LocalStrategy = require('passport-local').Strategy;
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
@@ -11,17 +12,28 @@ const User = require('./models/User');
 
 const app = express();
 
+// --- RENDER DEPLOYMENT CONFIGURATION ---
+// Trust the reverse proxy that Render uses so secure cookies (HTTPS) work correctly
+app.set('trust proxy', 1); 
+
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Session Setup
+// Session Setup (Stored in MongoDB so it survives Render restarts)
 app.use(session({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.SESSION_SECRET || 'fallback_secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 24 * 60 * 60 * 1000 } // 1 day
+  store: MongoStore.create({ 
+    mongoUrl: process.env.MONGO_URI,
+    collectionName: 'sessions'
+  }),
+  cookie: { 
+    maxAge: 24 * 60 * 60 * 1000, // 1 day
+    secure: process.env.NODE_ENV === 'production' // Set to true if using HTTPS (Render provides this)
+  }
 }));
 
 app.use(passport.initialize());
@@ -53,13 +65,13 @@ passport.use(new LocalStrategy({ usernameField: 'email' }, async (email, passwor
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: "/auth/google/callback"
+  callbackURL: "/auth/google/callback",
+  proxy: true // Required for Render
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     let user = await User.findOne({ googleId: profile.id });
     if (user) return done(null, user);
 
-    // Create new user if not found (using email as placeholder for required fields)
     const newUser = new User({
       googleId: profile.id,
       firstName: profile.name.givenName || 'Google',
@@ -78,7 +90,8 @@ passport.use(new GoogleStrategy({
 passport.use(new GitHubStrategy({
   clientID: process.env.GITHUB_CLIENT_ID,
   clientSecret: process.env.GITHUB_CLIENT_SECRET,
-  callbackURL: "/auth/github/callback"
+  callbackURL: "/auth/github/callback",
+  proxy: true // Required for Render
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     let user = await User.findOne({ githubId: profile.id });
@@ -100,8 +113,12 @@ passport.use(new GitHubStrategy({
 
 passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => {
-  const user = await User.findById(id);
-  done(null, user);
+  try {
+    const user = await User.findById(id);
+    done(null, user);
+  } catch (err) {
+    done(err, null);
+  }
 });
 
 // --- ROUTES ---
@@ -116,7 +133,6 @@ app.post('/api/register', async (req, res) => {
     const newUser = new User({ firstName, lastName, email, phone, password });
     await newUser.save();
     
-    // Auto-login after registration
     req.login(newUser, (err) => {
       if (err) return res.status(500).json({ message: 'Error logging in' });
       return res.status(201).json({ message: 'User registered successfully', user: newUser });
@@ -129,15 +145,20 @@ app.post('/api/register', async (req, res) => {
 // Google Auth Routes
 app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 app.get('/auth/google/callback', 
-  passport.authenticate('google', { failureRedirect: '/index.html' }),
-  (req, res) => res.redirect('/dashboard.html') // Redirect to a protected page after login
+  passport.authenticate('google', { failureRedirect: '/' }),
+  (req, res) => {
+    // Redirect to your dashboard or home page after successful login
+    res.redirect('/dashboard.html'); 
+  }
 );
 
 // GitHub Auth Routes
 app.get('/auth/github', passport.authenticate('github', { scope: ['user:email'] }));
 app.get('/auth/github/callback', 
-  passport.authenticate('github', { failureRedirect: '/index.html' }),
-  (req, res) => res.redirect('/dashboard.html')
+  passport.authenticate('github', { failureRedirect: '/' }),
+  (req, res) => {
+    res.redirect('/dashboard.html');
+  }
 );
 
 // Logout Route
@@ -148,6 +169,6 @@ app.get('/api/logout', (req, res) => {
   });
 });
 
-// Start Server
+// Start Server (Render dynamically assigns the PORT)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
