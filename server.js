@@ -8,12 +8,11 @@ const LocalStrategy = require('passport-local').Strategy;
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const GitHubStrategy = require('passport-github2').Strategy;
 const path = require('path');
-const User = require('./models/User');
+const bcrypt = require('bcryptjs'); // Moved here from User.js
 
 const app = express();
 
 // --- RENDER DEPLOYMENT CONFIGURATION ---
-// Trust the reverse proxy that Render uses so secure cookies (HTTPS) work correctly
 app.set('trust proxy', 1); 
 
 // Middleware
@@ -21,7 +20,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Session Setup (Stored in MongoDB so it survives Render restarts)
+// Session Setup (Stored in MongoDB)
 app.use(session({
   secret: process.env.SESSION_SECRET || 'fallback_secret',
   resave: false,
@@ -32,17 +31,45 @@ app.use(session({
   }),
   cookie: { 
     maxAge: 24 * 60 * 60 * 1000, // 1 day
-    secure: process.env.NODE_ENV === 'production' // Set to true if using HTTPS (Render provides this)
+    secure: process.env.NODE_ENV === 'production' 
   }
 }));
 
 app.use(passport.initialize());
 app.use(passport.session());
 
-// MongoDB Connection
+// --- MONGODB CONNECTION ---
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected'))
   .catch(err => console.error('MongoDB Connection Error:', err));
+
+// --- USER MODEL (Merged from models/User.js) ---
+const userSchema = new mongoose.Schema({
+  firstName: { type: String, required: true },
+  lastName: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  phone: { type: String, required: true },
+  password: { type: String }, // Optional for OAuth users
+  googleId: { type: String },
+  githubId: { type: String }
+});
+
+// Hash password before saving
+userSchema.pre('save', async function (next) {
+  if (!this.isModified('password') || !this.password) return next();
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(this.password, salt);
+  next();
+});
+
+// Compare password method
+userSchema.methods.comparePassword = async function (enteredPassword) {
+  return await bcrypt.compare(enteredPassword, this.password);
+};
+
+// Create the model
+const User = mongoose.model('User', userSchema);
+// ------------------------------------------------
 
 // --- PASSPORT CONFIGURATION ---
 
@@ -66,7 +93,7 @@ passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
   callbackURL: "/auth/google/callback",
-  proxy: true // Required for Render
+  proxy: true 
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     let user = await User.findOne({ googleId: profile.id });
@@ -91,7 +118,7 @@ passport.use(new GitHubStrategy({
   clientID: process.env.GITHUB_CLIENT_ID,
   clientSecret: process.env.GITHUB_CLIENT_SECRET,
   callbackURL: "/auth/github/callback",
-  proxy: true // Required for Render
+  proxy: true 
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     let user = await User.findOne({ githubId: profile.id });
@@ -147,7 +174,6 @@ app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'em
 app.get('/auth/google/callback', 
   passport.authenticate('google', { failureRedirect: '/' }),
   (req, res) => {
-    // Redirect to your dashboard or home page after successful login
     res.redirect('/dashboard.html'); 
   }
 );
@@ -169,6 +195,6 @@ app.get('/api/logout', (req, res) => {
   });
 });
 
-// Start Server (Render dynamically assigns the PORT)
+// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
